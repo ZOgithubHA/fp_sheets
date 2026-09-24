@@ -95,7 +95,7 @@ export default function App() {
         const res = await fetch('/api/inventory/state');
         if (!res.ok) return;
         const data = await res.json();
-        if (data.success && data.revision && data.rows && data.rows.length > 0) {
+        if (data.success && data.revision !== undefined && Array.isArray(data.rows)) {
           if (lastRevision > 0 && data.revision > lastRevision) {
             setDataset((prev) => {
               return analyzeDataset(

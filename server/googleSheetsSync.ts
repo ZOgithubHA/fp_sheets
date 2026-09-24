@@ -386,82 +386,19 @@ export async function syncGoogleSheetsToInventory(customUrl?: string): Promise<{
     // 1. Fetch Лист1 (Сотрудники)
     const fetched = await fetchSpreadsheetData(url);
     let mergedRows: BotEquipmentRecord[] = [];
-    if (fetched.success && fetched.rows && fetched.rows.length > 0) {
-      const currentCache = getInventoryCache();
+    if (fetched.success && Array.isArray(fetched.rows)) {
+      // Google Sheets is the single source of truth:
+      // If rows are deleted or cleared in Google Sheets, the local cache must strictly reflect that!
       mergedRows = [...fetched.rows];
-
-      // Preserve local records added via Bot if not yet in remote Google Sheet
-      if (currentCache.rows && currentCache.rows.length > 0) {
-        currentCache.rows.forEach((localItem) => {
-          const localPcId = String(localItem["Идентификатор ПК"] || "").trim().toLowerCase();
-          const localUser = String(localItem["Имя пользователя"] || "").trim().toLowerCase();
-          const localType = String(localItem["Тип"] || "").trim().toLowerCase();
-          const localBrand = String(localItem["Марка"] || "").trim().toLowerCase();
-          const localSn = String(localItem["S/N"] || "").trim().toLowerCase();
-
-          const alreadyInRemote = mergedRows.some((remoteItem) => {
-            const remotePcId = String(remoteItem["Идентификатор ПК"] || "").trim().toLowerCase();
-            if (localPcId && remotePcId && localPcId === remotePcId) return true;
-
-            const remoteUser = String(remoteItem["Имя пользователя"] || "").trim().toLowerCase();
-            const remoteType = String(remoteItem["Тип"] || "").trim().toLowerCase();
-            const remoteBrand = String(remoteItem["Марка"] || "").trim().toLowerCase();
-            const remoteSn = String(remoteItem["S/N"] || "").trim().toLowerCase();
-
-            if (
-              localUser &&
-              remoteUser &&
-              localUser === remoteUser &&
-              localType === remoteType &&
-              localBrand === remoteBrand
-            ) {
-              if (!localSn || localSn === "—" || !remoteSn || remoteSn === "—" || localSn === remoteSn) {
-                return true;
-              }
-            }
-            return false;
-          });
-
-          if (!alreadyInRemote && (localUser || localType || localBrand || localPcId)) {
-            mergedRows = insertRecordForUser(mergedRows, localItem);
-          }
-        });
-      }
-
-      setInventoryCache(mergedRows, fetched.columns);
+      setInventoryCache(mergedRows, fetched.columns && fetched.columns.length > 0 ? fetched.columns : undefined);
     }
 
     // 2. Fetch Лист «Склад»
     let warehouseRowCount = 0;
     const fetchedWarehouse = await fetchWarehouseSpreadsheetData(url);
-    if (fetchedWarehouse.success && fetchedWarehouse.rows && fetchedWarehouse.rows.length > 0) {
-      const currentWh = getWarehouseInventory();
-      let mergedWh = [...fetchedWarehouse.rows];
-
-      // Preserve local warehouse items not yet seen remotely
-      if (currentWh && currentWh.length > 0) {
-        currentWh.forEach((localWh) => {
-          const lBrand = String(localWh["Марка и модели"] || "").trim().toLowerCase();
-          const lType = String(localWh["Типы"] || "").trim().toLowerCase();
-          const lDoc = String(localWh["Основание"] || "").trim().toLowerCase();
-          const lUnit = String(localWh["Единица измерения (м, шт.)"] || "").trim().toLowerCase();
-
-          const exists = mergedWh.some((rWh) => {
-            const rBrand = String(rWh["Марка и модели"] || "").trim().toLowerCase();
-            const rType = String(rWh["Типы"] || "").trim().toLowerCase();
-            const rDoc = String(rWh["Основание"] || "").trim().toLowerCase();
-            const rUnit = String(rWh["Единица измерения (м, шт.)"] || "").trim().toLowerCase();
-            return lBrand === rBrand && lType === rType && (lDoc === rDoc || lUnit === rUnit);
-          });
-
-          if (!exists) {
-            mergedWh.push({ ...localWh, "№ П/П": mergedWh.length + 1 });
-          }
-        });
-      }
-
-      setWarehouseInventoryCache(mergedWh, WAREHOUSE_HEADERS);
-      warehouseRowCount = mergedWh.length;
+    if (fetchedWarehouse.success && Array.isArray(fetchedWarehouse.rows)) {
+      setWarehouseInventoryCache(fetchedWarehouse.rows, WAREHOUSE_HEADERS);
+      warehouseRowCount = fetchedWarehouse.rows.length;
     }
 
     touchInventoryRevision("Синхронизировано с Google Sheets (Лист1 и Склад)");

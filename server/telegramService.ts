@@ -253,8 +253,8 @@ export function getWarehouseColumns(): string[] {
 }
 
 export function setWarehouseInventoryCache(rows: WarehouseSheetRecord[], cols?: string[]) {
-  if (rows && rows.length > 0) {
-    activeWarehouseInventory = rows;
+  if (Array.isArray(rows)) {
+    activeWarehouseInventory = [...rows];
   }
   if (cols && cols.length > 0) {
     activeWarehouseColumns = cols;
@@ -680,8 +680,8 @@ export async function pushAllInventoryToGoogleSheet(rows?: BotEquipmentRecord[])
 }
 
 export function setInventoryCache(rows: BotEquipmentRecord[], cols?: string[]) {
-  if (rows && rows.length > 0) {
-    activeInventory = rows;
+  if (Array.isArray(rows)) {
+    activeInventory = [...rows];
   }
   if (cols && cols.length > 0) {
     activeColumns = cols;
