@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: fp-sheets-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TELEGRAM_BOT_TOKEN
+        value: 8661379316:AAGtH3hBc964NlBMVFNnfiDYT5qpzO2BlJI
+      - key: SPREADSHEET_URL
+        value: https://docs.google.com/spreadsheets/d/17mxs3jdsSjeQQtDWmxUuQ72s7F9QmJMU12Am0uKPs6Q/edit?usp=sharing
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_APPS_SCRIPT_URL
+        sync: false

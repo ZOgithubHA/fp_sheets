@@ -1,0 +1,14 @@
+services:
+  it-asset-bot:
+    build: .
+    container_name: fp_sheets_bot
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-8661379316:AAGtH3hBc964NlBMVFNnfiDYT5qpzO2BlJI}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SPREADSHEET_URL=${SPREADSHEET_URL:-https://docs.google.com/spreadsheets/d/17mxs3jdsSjeQQtDWmxUuQ72s7F9QmJMU12Am0uKPs6Q/edit?usp=sharing}
+      - GOOGLE_APPS_SCRIPT_URL=${GOOGLE_APPS_SCRIPT_URL}

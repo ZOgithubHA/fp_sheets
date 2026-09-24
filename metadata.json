@@ -1,0 +1,6 @@
+{
+  "name": "Google Sheets Explorer & Analyzer",
+  "description": "Explore, inspect, and analyze Google Sheets spreadsheets with interactive tables, charts, summaries, and AI-powered insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
