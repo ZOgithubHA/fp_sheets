@@ -3,7 +3,6 @@ import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
 import { createRequire } from "module";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import Papa from "papaparse";
 
@@ -1136,6 +1135,7 @@ app.post("/api/github/push", async (req, res) => {
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
