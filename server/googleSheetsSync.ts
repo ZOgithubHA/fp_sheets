@@ -252,6 +252,13 @@ export async function fetchSpreadsheetData(
       cleanRow[col] = val;
     });
 
+    const movVal = String(cleanRow["Движения"] || cleanRow["Движение"] || "").toLowerCase();
+    const noteVal = String(cleanRow["Запись"] || cleanRow["Примечания"] || "").toLowerCase();
+    if (movVal.includes("сдал") || movVal.includes("возврат") || noteVal.includes("возврат от:")) {
+      // Сданная техника удаляется с Листа сотрудников и учитывается исключительно на листе «Склад»
+      continue;
+    }
+
     if (cleanRow[userCol]) {
       rows.push(cleanRow as BotEquipmentRecord);
     }

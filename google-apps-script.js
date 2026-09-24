@@ -628,21 +628,19 @@ function handleReturnEquipment(ctx, payload) {
   var receiver = payload.receiver || "Зохид Зокиров";
   var employeeRowIndex = Number(payload.employeeRowIndex || -1);
 
-  // 1) На листе сотрудников отмечаем возврат
+  // 1) На листе сотрудников УДАЛЯЕМ сданную строку (чтобы не оставалось пометок и путаницы, всё хранится на листе «Склад»)
   var esData = es.getDataRange().getValues();
   if (employeeRowIndex > 0 && employeeRowIndex < esData.length) {
-    es.getRange(employeeRowIndex + 1, 9).setValue("Сдал (Возврат на склад)");
-    es.getRange(employeeRowIndex + 1, 10).setValue("Сдано на склад " + receiver + " " + timeStr);
+    es.deleteRow(employeeRowIndex + 1);
   } else if (username) {
-    for (var i = 1; i < esData.length; i++) {
+    for (var i = esData.length - 1; i >= 1; i--) {
       var rowUser = String(esData[i][1] || "").trim().toLowerCase();
       var rowType = String(esData[i][3] || "").trim().toLowerCase();
       if (rowUser.indexOf(username.toLowerCase()) !== -1 && (!type || rowType === type.toLowerCase())) {
-        es.getRange(i + 1, 9).setValue("Сдал (Возврат на склад)");
-        es.getRange(i + 1, 10).setValue("Сдано на склад " + receiver + " " + timeStr);
         if (!type) type = String(esData[i][3] || "");
         if (!brand) brand = String(esData[i][4] || "");
         if (!position) position = String(esData[i][2] || "");
+        es.deleteRow(i + 1);
         break;
       }
     }
@@ -746,7 +744,7 @@ function handleSyncAll(ctx, payload) {
   var ws = ctx.warehouseSheet;
 
   // 1) Лист сотрудников
-  if (payload.rows && payload.rows.length > 0) {
+  if (payload.rows && Array.isArray(payload.rows)) {
     var empRows = payload.rows;
     var empCols = payload.columns || EMPLOYEE_HEADERS;
     var empValues = [empCols];
@@ -767,7 +765,7 @@ function handleSyncAll(ctx, payload) {
   }
 
   // 2) Лист «Склад»
-  if (payload.warehouseRows && payload.warehouseRows.length > 0) {
+  if (payload.warehouseRows && Array.isArray(payload.warehouseRows)) {
     var whRows = payload.warehouseRows;
     var whCols = payload.warehouseColumns || WAREHOUSE_HEADERS;
     var whValues = [whCols];

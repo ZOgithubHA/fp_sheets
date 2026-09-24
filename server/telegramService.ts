@@ -2,6 +2,7 @@ import { GoogleGenAI } from "@google/genai";
 import { generateContentWithRetry } from "./geminiHelper.ts";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 
 const CONFIG_FILE_PATH = path.join(process.cwd(), "server", "sync-config.json");
 
@@ -167,8 +168,14 @@ function loadInitialInventory(): BotEquipmentRecord[] {
       const raw = fs.readFileSync(jsonPath, "utf-8");
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        console.log(`[Inventory] Loaded ${parsed.length} records from server/initial-inventory.json`);
-        return parsed;
+        // Сданная техника удаляется из списка сотрудника и учитывается исключительно на листе «Склад»
+        const clean = parsed.filter((r) => {
+          const mov = String(r["Движения"] || "").toLowerCase();
+          const notes = String(r["Запись"] || "").toLowerCase();
+          return !mov.includes("сдал") && !mov.includes("возврат") && !notes.includes("возврат от:");
+        });
+        console.log(`[Inventory] Loaded ${clean.length} active records from server/initial-inventory.json`);
+        return clean;
       }
     }
   } catch (err) {
@@ -286,26 +293,59 @@ export function escapeHtml(str: any): string {
     .replace(/>/g, '&gt;');
 }
 
-// Global short-key registry for Telegram inline callback_data (max 64 bytes limit)
+// Global stable short-key registry for Telegram inline callback_data (max 64 bytes limit)
+const CALLBACK_CACHE_FILE = path.join(process.cwd(), "server", "callback-cache.json");
 const shortDataStore = new Map<string, string>();
-let shortDataCounter = 1;
+
+function loadCallbackCache() {
+  try {
+    if (fs.existsSync(CALLBACK_CACHE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(CALLBACK_CACHE_FILE, "utf-8"));
+      for (const [k, v] of Object.entries(parsed)) {
+        shortDataStore.set(k, String(v));
+      }
+    }
+  } catch (e) {
+    console.warn("[Callback Cache Load Warning]:", e);
+  }
+}
+loadCallbackCache();
+
+function saveCallbackCache() {
+  try {
+    const dir = path.dirname(CALLBACK_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const obj: Record<string, string> = {};
+    for (const [k, v] of shortDataStore.entries()) {
+      obj[k] = v;
+    }
+    fs.writeFileSync(CALLBACK_CACHE_FILE, JSON.stringify(obj, null, 2), "utf-8");
+  } catch (e) {
+    console.warn("[Callback Cache Save Warning]:", e);
+  }
+}
 
 export function registerCallbackPayload(payload: string): string {
   if (!payload) return 'empty';
-  for (const [key, val] of shortDataStore.entries()) {
-    if (val === payload) return key;
-  }
-  const id = `k_${(shortDataCounter++).toString(36)}`;
-  shortDataStore.set(id, payload);
-  if (shortDataStore.size > 3000) {
-    const firstKey = shortDataStore.keys().next().value;
-    if (firstKey) shortDataStore.delete(firstKey);
+  const clean = String(payload).trim();
+
+  // Deterministic 8-char hex hash from payload text (never shifts across server reloads or user order)
+  const hash = crypto.createHash('md5').update(clean).digest('hex').slice(0, 8);
+  const id = `u_${hash}`;
+
+  if (!shortDataStore.has(id)) {
+    shortDataStore.set(id, clean);
+    saveCallbackCache();
   }
   return id;
 }
 
 export function resolveCallbackPayload(key: string): string {
   if (!key || key === 'empty') return '';
+  if (shortDataStore.has(key)) {
+    return shortDataStore.get(key)!;
+  }
+  loadCallbackCache();
   if (shortDataStore.has(key)) {
     return shortDataStore.get(key)!;
   }
@@ -681,7 +721,12 @@ export async function pushAllInventoryToGoogleSheet(rows?: BotEquipmentRecord[])
 
 export function setInventoryCache(rows: BotEquipmentRecord[], cols?: string[]) {
   if (Array.isArray(rows)) {
-    activeInventory = [...rows];
+    // Сданная техника удаляется из списка сотрудника и учитывается исключительно на листе «Склад»
+    activeInventory = rows.filter((r) => {
+      const mov = String(r["Движения"] || "").toLowerCase();
+      const notes = String(r["Запись"] || "").toLowerCase();
+      return !mov.includes("сдал") && !mov.includes("возврат") && !notes.includes("возврат от:");
+    });
   }
   if (cols && cols.length > 0) {
     activeColumns = cols;
@@ -829,7 +874,7 @@ export async function deleteRecordFromInventory(target: Partial<BotEquipmentReco
 
 /**
  * Return an employee's equipment back to warehouse (строгая взаимосвязь Лист1 и Склад)
- * На Лист1: строка сотрудника помечается «Сдал (Возврат на склад)» без порчи его имени
+ * На Лист1: строка сотрудника ПОЛНОСТЬЮ УДАЛЯЕТСЯ, чтобы не засорять список и карточку сотрудника.
  * На Лист «Склад»: вносится новая запись в 8-колоночной форме со статусом «Склад ИТ (В наличии)»
  */
 export async function returnEquipmentToWarehouse(
@@ -837,7 +882,7 @@ export async function returnEquipmentToWarehouse(
   extraNotes?: string
 ): Promise<{ success: boolean; item?: BotEquipmentRecord; warehouseRecord?: WarehouseSheetRecord; message: string }> {
   const userCol = activeColumns.find((c) => /имя пользователя|фио|пользователь|сотрудник/i.test(c)) || 'Имя пользователя';
-  const notesCol = activeColumns.find((c) => /запись|примечание/i.test(c)) || 'Запись';
+  const posCol = activeColumns.find((c) => /должность/i.test(c)) || 'Должность';
 
   let foundIndex = -1;
   if (target.index !== undefined && target.index >= 0 && target.index < activeInventory.length) {
@@ -846,15 +891,21 @@ export async function returnEquipmentToWarehouse(
     const tUser = String(target[userCol] || target["Имя пользователя"] || "").trim().toLowerCase();
     const tSn = String(target["S/N"] || "").trim().toLowerCase();
     const tBrand = String(target["Марка"] || "").trim().toLowerCase();
+    const tType = String(target["Тип"] || "").trim().toLowerCase();
 
     for (let i = 0; i < activeInventory.length; i++) {
       const item = activeInventory[i];
       const iUser = String(item[userCol] || item["Имя пользователя"] || "").trim().toLowerCase();
       const iSn = String(item["S/N"] || "").trim().toLowerCase();
       const iBrand = String(item["Марка"] || "").trim().toLowerCase();
+      const iType = String(item["Тип"] || "").trim().toLowerCase();
 
       if (tUser && (iUser === tUser || iUser.includes(tUser))) {
         if (tSn && tSn !== '—' && tSn !== '-' && iSn === tSn) {
+          foundIndex = i;
+          break;
+        }
+        if (tType && tBrand && iType === tType && iBrand === tBrand) {
           foundIndex = i;
           break;
         }
@@ -870,40 +921,33 @@ export async function returnEquipmentToWarehouse(
     return { success: false, message: "Оборудование сотрудника не найдено" };
   }
 
-  const item = activeInventory[foundIndex];
-  const previousUser = String(item[userCol] || item["Имя пользователя"] || "Сотрудник").trim();
-  const previousPosition = String(item["Должность"] || "").trim();
-  const nowStr = formatDateTimeCustom();
-  const returnBracket = `(Возврат от: ${previousUser}, ${nowStr.slice(0, 10)})`;
-
-  const oldNotes = String(item[notesCol] || item["Запись"] || "").trim();
-  const updatedNotes = oldNotes ? `${oldNotes} ${returnBracket}` : returnBracket;
-
-  // 1. Обновляем строку на Лист1 (сохраняя ФИО сотрудника!)
-  item["Движения"] = "Сдал (Возврат на склад)";
-  item["Отметка времени"] = nowStr;
-  item["Запись"] = extraNotes ? `${updatedNotes} [${extraNotes}]` : updatedNotes;
+  // 1. Полностью удаляем сданную единицу из списка сотрудника (Лист1)
+  const [removedItem] = activeInventory.splice(foundIndex, 1);
   saveInventoryToFile();
+
+  const previousUser = String(removedItem[userCol] || removedItem["Имя пользователя"] || "Сотрудник").trim();
+  const previousPosition = String(removedItem[posCol] || removedItem["Должность"] || "").trim();
+  const nowStr = formatDateTimeCustom();
 
   // 2. Вносим новую строку на лист «Склад» в строгой 8-колоночной форме
   const nextWhNum = activeWarehouseInventory.length + 1;
   const whRec: WarehouseSheetRecord = {
     "№ П/П": nextWhNum,
-    "Типы": item["Тип"] || "Оборудование",
-    "Марка и модели": item["Марка"] || "—",
+    "Типы": removedItem["Тип"] || "Оборудование",
+    "Марка и модели": removedItem["Марка"] || "—",
     "Единица измерения (м, шт.)": "Склад ИТ (В наличии)",
     "Запись документа": nowStr,
     "Кто принял": "Зохид Зокиров",
     "Движение товаров": `Возврат на склад (от ${previousUser})`,
-    "Основание": `Возврат от сотрудника: ${previousUser}${previousPosition ? ` (${previousPosition})` : ''}${item["S/N"] ? `, S/N: ${item["S/N"]}` : ''}${extraNotes ? ` [${extraNotes}]` : ''}`
+    "Основание": `Возврат от сотрудника: ${previousUser}${previousPosition ? ` (${previousPosition})` : ''}${removedItem["S/N"] ? `, S/N: ${removedItem["S/N"]}` : ''}${extraNotes ? ` [${extraNotes}]` : ''}`
   };
 
   activeWarehouseInventory.push(whRec);
   saveWarehouseInventoryToFile();
 
-  touchInventoryRevision(`Возврат на склад от ${previousUser}: ${item["Тип"]} ${item["Марка"]}`);
+  touchInventoryRevision(`Возврат на склад от ${previousUser}: ${removedItem["Тип"]} ${removedItem["Марка"]}`);
 
-  // 3. Синхронизируем оба листа в Google Таблицу
+  // 3. Синхронизируем оба листа в Google Таблицу (с Лист1 строка удаляется, на Склад добавляется)
   const scriptUrl = getGoogleAppsScriptUrl();
   if (scriptUrl) {
     try {
@@ -915,9 +959,102 @@ export async function returnEquipmentToWarehouse(
 
   return {
     success: true,
-    item,
+    item: removedItem,
     warehouseRecord: whRec,
-    message: `Техника «${item["Тип"]} ${item["Марка"]}» возвращена на Склад (в наличии) и зафиксирована на обоих листах таблицы!`
+    message: `Техника «${removedItem["Тип"]} ${removedItem["Марка"]}» возвращена на Склад (в наличии) и удалена из списка сотрудника!`
+  };
+}
+
+/**
+ * Return multiple equipment items (or ALL items) for a user back to warehouse at once
+ */
+export async function returnMultipleEquipmentToWarehouse(
+  userName: string,
+  targetItems: BotEquipmentRecord[],
+  extraNotes?: string
+): Promise<{
+  success: boolean;
+  returnedCount: number;
+  returnedItems: BotEquipmentRecord[];
+  warehouseRecords: WarehouseSheetRecord[];
+  message: string;
+}> {
+  const userCol = activeColumns.find((c) => /имя пользователя|фио|пользователь|сотрудник/i.test(c)) || 'Имя пользователя';
+  const posCol = activeColumns.find((c) => /должность/i.test(c)) || 'Должность';
+
+  const returnedItems: BotEquipmentRecord[] = [];
+  const warehouseRecords: WarehouseSheetRecord[] = [];
+  const nowStr = formatDateTimeCustom();
+  const cleanUser = userName.trim().toLowerCase();
+
+  for (const tItem of targetItems) {
+    const tType = String(tItem["Тип"] || "").trim().toLowerCase();
+    const tBrand = String(tItem["Марка"] || "").trim().toLowerCase();
+    const tSn = String(tItem["S/N"] || "").trim().toLowerCase();
+
+    const idx = activeInventory.findIndex((row) => {
+      const rUser = String(row[userCol] || row["Имя пользователя"] || "").trim().toLowerCase();
+      if (rUser !== cleanUser && !rUser.includes(cleanUser) && !cleanUser.includes(rUser)) return false;
+
+      const rSn = String(row["S/N"] || "").trim().toLowerCase();
+      if (tSn && tSn !== '—' && tSn !== '-' && rSn === tSn) return true;
+
+      const rType = String(row["Тип"] || "").trim().toLowerCase();
+      const rBrand = String(row["Марка"] || "").trim().toLowerCase();
+      return rType === tType && rBrand === tBrand;
+    });
+
+    if (idx !== -1) {
+      const [removed] = activeInventory.splice(idx, 1);
+      returnedItems.push(removed);
+
+      const pos = String(removed[posCol] || removed["Должность"] || "").trim();
+      const nextWhNum = activeWarehouseInventory.length + 1;
+      const whRec: WarehouseSheetRecord = {
+        "№ П/П": nextWhNum,
+        "Типы": removed["Тип"] || "Оборудование",
+        "Марка и модели": removed["Марка"] || "—",
+        "Единица измерения (м, шт.)": "Склад ИТ (В наличии)",
+        "Запись документа": nowStr,
+        "Кто принял": "Зохид Зокиров",
+        "Движение товаров": `Возврат на склад (от ${userName})`,
+        "Основание": `Возврат от сотрудника: ${userName}${pos ? ` (${pos})` : ''}${removed["S/N"] ? `, S/N: ${removed["S/N"]}` : ''}${extraNotes ? ` [${extraNotes}]` : ''}`
+      };
+      activeWarehouseInventory.push(whRec);
+      warehouseRecords.push(whRec);
+    }
+  }
+
+  if (returnedItems.length === 0) {
+    return {
+      success: false,
+      returnedCount: 0,
+      returnedItems: [],
+      warehouseRecords: [],
+      message: "Выбранная техника не найдена у сотрудника"
+    };
+  }
+
+  saveInventoryToFile();
+  saveWarehouseInventoryToFile();
+
+  touchInventoryRevision(`Возврат на склад от ${userName}: ${returnedItems.length} ед.`);
+
+  const scriptUrl = getGoogleAppsScriptUrl();
+  if (scriptUrl) {
+    try {
+      await pushDualSyncToGoogleSheets();
+    } catch (e: any) {
+      console.warn('[Multiple Return Sync Error]:', e.message);
+    }
+  }
+
+  return {
+    success: true,
+    returnedCount: returnedItems.length,
+    returnedItems,
+    warehouseRecords,
+    message: `Успешно сдано на склад ${returnedItems.length} ед. техники от сотрудника ${userName}!`
   };
 }
 
@@ -2484,7 +2621,7 @@ export async function handleBotInteraction(
     }
 
     // ==========================================
-    // 🔄 ВОЗВРАТ ТЕХНИКИ НА СКЛАД (ПЛЮСУЕТСЯ НА СКЛАД С ПОМЕТКОЙ)
+    // 🔄 ВОЗВРАТ ТЕХНИКИ НА СКЛАД (ПЕРЕХОД НА СКЛАД + УДАЛЕНИЕ С ЛИСТ1)
     // ==========================================
     if (data.startsWith('rtu:')) {
       const rawKey = data.split(':')[1] || '';
@@ -2494,35 +2631,267 @@ export async function handleBotInteraction(
 
       if (userItems.length === 0) {
         return {
-          text: `ℹ️ У сотрудника <b>${escapeHtml(userName)}</b> нет техники для возврата.`,
+          text: `ℹ️ У сотрудника <b>${escapeHtml(userName)}</b> нет активной техники для возврата.`,
           inlineKeyboard: [
-            [{ text: '👤 Вернуться к сотруднику', callback_data: `vu:${rawKey}` }]
+            [{ text: '👤 Вернуться к сотруднику', callback_data: `vu:${rawKey}` }],
+            [{ text: '🏠 Главное меню', callback_data: 'main_menu' }]
           ]
         };
       }
 
-      const buttons = userItems.map((item, idx) => {
+      const buttons: any[][] = [];
+
+      // 1. Сдать всё разом в 1 клик
+      buttons.push([
+        { text: `📦 СДАТЬ ВСЁ ОБОРУДОВАНИЕ (${userItems.length} ед.)`, callback_data: `ret_all:${rawKey}` }
+      ]);
+
+      // 2. Выбрать несколько позиций галочками
+      if (userItems.length > 1) {
+        buttons.push([
+          { text: `☑️ Выбрать несколько позиций (галочками)`, callback_data: `ret_m:${rawKey}:none` }
+        ]);
+      }
+
+      // 3. Поштучный возврат конкретной единицы
+      userItems.forEach((item, idx) => {
         const type = item["Тип"] || 'Техника';
         const brand = item["Марка"] || '—';
-        const sn = item["S/N"] ? ` (${item["S/N"]})` : '';
-        return [{
-          text: `${idx + 1}. 🔄 ${type} ${brand}${sn}`,
-          callback_data: `reti:${rawKey}:${idx}`
-        }];
+        const sn = item["S/N"] && item["S/N"] !== '—' && item["S/N"] !== '-' ? ` (${item["S/N"]})` : '';
+        buttons.push([
+          { text: `${idx + 1}. 🔄 ${type} ${brand}${sn}`, callback_data: `reti:${rawKey}:${idx}` }
+        ]);
       });
 
       buttons.push([
-        { text: '⬅️ Назад к сотруднику', callback_data: `vu:${rawKey}` }
+        { text: '⬅️ Назад к сотруднику', callback_data: `vu:${rawKey}` },
+        { text: '🏠 Главное меню', callback_data: 'main_menu' }
       ]);
 
       return {
         text: `🔄 <b>Возврат техники на склад:</b>\n` +
-          `👤 <b>Сотрудник:</b> ${escapeHtml(userName)}\n\n` +
-          `<i>Выберите единицу, которую сотрудник сдал / вернул:</i>`,
+          `👤 <b>Сотрудник:</b> ${escapeHtml(userName)}\n` +
+          `📦 <b>Закреплено техники:</b> ${userItems.length} ед.\n\n` +
+          `<i>Выберите вариант сдачи:</i>\n` +
+          `• <b>Сдать ВСЁ</b> — вернуть всю технику сотрудника на склад сразу\n` +
+          `• <b>Выбрать несколько</b> — отметить галочками нужные позиции\n` +
+          `• <b>По одной позиции</b> — нажмите на конкретное устройство из списка ниже\n\n` +
+          `<i>(Сданная техника удаляется из карточки сотрудника и появляется в остатках Склада)</i>`,
         inlineKeyboard: buttons
       };
     }
 
+    // Сдать ВСЁ оборудование сотрудника (Экран подтверждения)
+    if (data.startsWith('ret_all:')) {
+      const rawKey = data.split(':')[1] || '';
+      const userName = resolveCallbackPayload(rawKey);
+      const userCard = generateUserEquipmentCard(userName);
+      const userItems = userCard.items;
+
+      if (userItems.length === 0) {
+        return {
+          text: `ℹ️ У сотрудника <b>${escapeHtml(userName)}</b> нет техники для сдачи.`,
+          inlineKeyboard: [[{ text: '👤 К сотруднику', callback_data: `vu:${rawKey}` }]]
+        };
+      }
+
+      let listText = '';
+      userItems.forEach((it, i) => {
+        const sn = it["S/N"] && it["S/N"] !== '—' && it["S/N"] !== '-' ? ` (S/N: ${it["S/N"]})` : '';
+        listText += `${i + 1}. <b>${escapeHtml(it["Тип"] || '')} ${escapeHtml(it["Марка"] || '')}</b>${escapeHtml(sn)}\n`;
+      });
+
+      return {
+        text: `⚠️ <b>Подтверждение сдачи ВСЕЙ техники сотрудника:</b>\n\n` +
+          `👤 <b>Сотрудник:</b> ${escapeHtml(userName)}\n` +
+          `📦 <b>Будет сдано на склад:</b> ${userItems.length} ед.:\n\n` +
+          `${listText}\n` +
+          `Все эти позиции будут <b>удалены с карточки сотрудника (Лист1)</b> и <b>зачислены в остатки листа «Склад» (В наличии)</b>.\n\n` +
+          `Сдать всю технику на склад?`,
+        inlineKeyboard: [
+          [{ text: `✅ ДА, СДАТЬ ВСЕ ${userItems.length} ЕД. НА СКЛАД`, callback_data: `ret_all_exec:${rawKey}` }],
+          [{ text: `❌ Отмена / Назад`, callback_data: `rtu:${rawKey}` }]
+        ]
+      };
+    }
+
+    // Выполнение сдачи ВСЕГО оборудования
+    if (data.startsWith('ret_all_exec:')) {
+      const rawKey = data.split(':')[1] || '';
+      const userName = resolveCallbackPayload(rawKey);
+      const userCard = generateUserEquipmentCard(userName);
+      const userItems = [...userCard.items];
+
+      if (userItems.length === 0) {
+        return {
+          text: `ℹ️ У сотрудника <b>${escapeHtml(userName)}</b> нет техники для сдачи.`,
+          inlineKeyboard: [[{ text: '👤 К сотруднику', callback_data: `vu:${rawKey}` }]]
+        };
+      }
+
+      const res = await returnMultipleEquipmentToWarehouse(userName, userItems);
+
+      return {
+        text: `🟢 <b>Вся техника сотрудника успешно сдана на склад!</b>\n\n` +
+          `👤 <b>Сотрудник:</b> ${escapeHtml(userName)}\n` +
+          `📦 <b>Сдано на склад:</b> ${res.returnedCount} ед.\n\n` +
+          `• Все позиции зачислены на лист «Склад» со статусом «Склад ИТ (В наличии)».\n` +
+          `• С Листа сотрудников (Лист1) сданные строки полностью удалены.\n` +
+          `• Google Таблица синхронизирована!`,
+        inlineKeyboard: [
+          [{ text: '👤 Карточка сотрудника', callback_data: `vu:${rawKey}` }],
+          [{ text: '📦 Открыть остатки Склада', callback_data: 'warehouse_view' }],
+          [{ text: '🏠 Главное меню', callback_data: 'main_menu' }]
+        ],
+        updatedDataset: activeInventory,
+        notice: `Сдано на склад ${res.returnedCount} ед. от ${userName}`
+      };
+    }
+
+    // Выбор нескольких позиций галочками
+    if (data.startsWith('ret_m:') || data.startsWith('ret_mtog:')) {
+      const parts = data.split(':');
+      const isToggle = parts[0] === 'ret_mtog';
+      const rawKey = parts[1] || '';
+      const selStr = parts[2] || 'none';
+      const toggleIdx = isToggle ? parseInt(parts[3] || '-1', 10) : -1;
+
+      let selectedIndices: number[] = selStr === 'none' || !selStr ? [] : selStr.split('_').map((x) => parseInt(x, 10)).filter((x) => !isNaN(x));
+
+      if (isToggle && toggleIdx >= 0) {
+        if (selectedIndices.includes(toggleIdx)) {
+          selectedIndices = selectedIndices.filter((x) => x !== toggleIdx);
+        } else {
+          selectedIndices.push(toggleIdx);
+        }
+      }
+
+      selectedIndices.sort((a, b) => a - b);
+      const newSelStr = selectedIndices.length > 0 ? selectedIndices.join('_') : 'none';
+
+      const userName = resolveCallbackPayload(rawKey);
+      const userCard = generateUserEquipmentCard(userName);
+      const userItems = userCard.items;
+
+      const inlineKeyboard: any[][] = [];
+
+      userItems.forEach((item, idx) => {
+        const isSelected = selectedIndices.includes(idx);
+        const icon = isSelected ? '✅' : '⬜';
+        const type = item["Тип"] || 'Техника';
+        const brand = item["Марка"] || '—';
+        const sn = item["S/N"] && item["S/N"] !== '—' && item["S/N"] !== '-' ? ` (${item["S/N"]})` : '';
+
+        inlineKeyboard.push([
+          {
+            text: `${icon} ${idx + 1}. ${type} ${brand}${sn}`,
+            callback_data: `ret_mtog:${rawKey}:${newSelStr}:${idx}`
+          }
+        ]);
+      });
+
+      if (selectedIndices.length > 0) {
+        inlineKeyboard.push([
+          {
+            text: `✅ СДАТЬ ВЫБРАННЫЕ НА СКЛАД (${selectedIndices.length} шт.)`,
+            callback_data: `ret_mconf:${rawKey}:${newSelStr}`
+          }
+        ]);
+      }
+
+      inlineKeyboard.push([
+        { text: '⬅️ Назад (выбор режима сдачи)', callback_data: `rtu:${rawKey}` }
+      ]);
+
+      return {
+        text: `☑️ <b>Выбор нескольких единиц для сдачи на склад:</b>\n` +
+          `👤 <b>Сотрудник:</b> ${escapeHtml(userName)}\n\n` +
+          `<i>Нажимайте на позиции, чтобы отметить их галочками [✅]:</i>\n` +
+          `Отмечено для сдачи: <b>${selectedIndices.length} из ${userItems.length} шт.</b>`,
+        inlineKeyboard
+      };
+    }
+
+    // Подтверждение сдачи выбранных нескольких позиций
+    if (data.startsWith('ret_mconf:')) {
+      const parts = data.split(':');
+      const rawKey = parts[1] || '';
+      const selStr = parts[2] || '';
+      const selectedIndices = selStr.split('_').map((x) => parseInt(x, 10)).filter((x) => !isNaN(x));
+
+      const userName = resolveCallbackPayload(rawKey);
+      const userCard = generateUserEquipmentCard(userName);
+      const userItems = userCard.items;
+
+      const targetItems = selectedIndices.map((i) => userItems[i]).filter(Boolean);
+
+      if (targetItems.length === 0) {
+        return {
+          text: `⚠️ Не выбрано ни одной позиции для сдачи.`,
+          inlineKeyboard: [[{ text: '⬅️ Назад к выбору', callback_data: `ret_m:${rawKey}:none` }]]
+        };
+      }
+
+      let listText = '';
+      targetItems.forEach((it, i) => {
+        const sn = it["S/N"] && it["S/N"] !== '—' && it["S/N"] !== '-' ? ` (S/N: ${it["S/N"]})` : '';
+        listText += `${i + 1}. <b>${escapeHtml(it["Тип"] || '')} ${escapeHtml(it["Марка"] || '')}</b>${escapeHtml(sn)}\n`;
+      });
+
+      return {
+        text: `🔄 <b>Подтверждение сдачи выбранной техники:</b>\n\n` +
+          `👤 <b>Сотрудник:</b> ${escapeHtml(userName)}\n` +
+          `📦 <b>Выбрано для сдачи:</b> ${targetItems.length} ед.:\n\n` +
+          `${listText}\n` +
+          `Эти позиции будут <b>удалены из карточки сотрудника (Лист1)</b> и <b>зачислены в остатки листа «Склад»</b>.\n\n` +
+          `Сдать выбранные ${targetItems.length} ед. на склад?`,
+        inlineKeyboard: [
+          [{ text: `✅ ДА, СДАТЬ ВЫБРАННЫЕ (${targetItems.length} шт.)`, callback_data: `ret_mexec:${rawKey}:${selStr}` }],
+          [{ text: `❌ Отмена / Изменить выбор`, callback_data: `ret_m:${rawKey}:${selStr}` }]
+        ]
+      };
+    }
+
+    // Выполнение сдачи нескольких выбранных позиций
+    if (data.startsWith('ret_mexec:')) {
+      const parts = data.split(':');
+      const rawKey = parts[1] || '';
+      const selStr = parts[2] || '';
+      const selectedIndices = selStr.split('_').map((x) => parseInt(x, 10)).filter((x) => !isNaN(x));
+
+      const userName = resolveCallbackPayload(rawKey);
+      const userCard = generateUserEquipmentCard(userName);
+      const userItems = userCard.items;
+
+      const targetItems = selectedIndices.map((i) => userItems[i]).filter(Boolean);
+
+      if (targetItems.length === 0) {
+        return {
+          text: `⚠️ Позиции не найдены.`,
+          inlineKeyboard: [[{ text: '👤 К сотруднику', callback_data: `vu:${rawKey}` }]]
+        };
+      }
+
+      const res = await returnMultipleEquipmentToWarehouse(userName, targetItems);
+
+      return {
+        text: `🟢 <b>Выбранная техника успешно сдана на склад!</b>\n\n` +
+          `👤 <b>Сотрудник:</b> ${escapeHtml(userName)}\n` +
+          `📦 <b>Сдано на склад:</b> ${res.returnedCount} ед.\n\n` +
+          `• Все позиции зачислены на лист «Склад» со статусом «Склад ИТ (В наличии)».\n` +
+          `• С Листа сотрудников (Лист1) эти строки удалены.\n` +
+          `• Google Таблица обновлена!`,
+        inlineKeyboard: [
+          [{ text: '👤 Карточка сотрудника', callback_data: `vu:${rawKey}` }],
+          [{ text: '📦 Открыть остатки Склада', callback_data: 'warehouse_view' }],
+          [{ text: '🏠 Главное меню', callback_data: 'main_menu' }]
+        ],
+        updatedDataset: activeInventory,
+        notice: `Сдано на склад ${res.returnedCount} ед. от ${userName}`
+      };
+    }
+
+    // Поштучная сдача: Экран подтверждения
     if (data.startsWith('reti:')) {
       const parts = data.split(':');
       const rawKey = parts[1] || '';
@@ -2538,23 +2907,21 @@ export async function handleBotInteraction(
         };
       }
 
-      const todayStr = new Date().toLocaleDateString('ru-RU');
-
       return {
         text: `🔄 <b>Прием техники на склад от сотрудника:</b>\n\n` +
           `👤 <b>Сотрудник:</b> ${escapeHtml(userName)}\n` +
           `📦 <b>Техника:</b> ${escapeHtml(item["Тип"] || '—')} ${escapeHtml(item["Марка"] || '—')}\n` +
           `🔢 <b>S/N:</b> <code>${escapeHtml(item["S/N"] || '—')}</code>\n\n` +
-          `При подтверждении техника <b>снимется с сотрудника</b>, <b>перейдет в остатки Склада</b>, ` +
-          `а в графе «Запись» будет добавлена пометка:\n<code>(Возврат от: ${escapeHtml(userName)}, ${todayStr})</code>.\n\n` +
+          `При подтверждении техника <b>будет удалена из списка сотрудника (Лист1)</b> и <b>перейдет в остатки листа «Склад» (В наличии)</b>.\n\n` +
           `Принять технику на склад?`,
         inlineKeyboard: [
           [{ text: '✅ Да, принять на склад', callback_data: `cret:${rawKey}:${itemIdx}` }],
-          [{ text: '❌ Отмена', callback_data: `vu:${rawKey}` }]
+          [{ text: '❌ Отмена', callback_data: `rtu:${rawKey}` }]
         ]
       };
     }
 
+    // Поштучная сдача: Выполнение
     if (data.startsWith('cret:')) {
       const parts = data.split(':');
       const rawKey = parts[1] || '';
@@ -2571,17 +2938,18 @@ export async function handleBotInteraction(
       }
 
       const retRes = await returnEquipmentToWarehouse({
-        "Имя пользователя": item["Имя пользователя"],
+        "Имя пользователя": item["Имя пользователя"] || userName,
         "Тип": item["Тип"],
         "Марка": item["Марка"],
         "S/N": item["S/N"],
       });
 
       return {
-        text: `🟢 <b>Техника успешно принята на склад!</b>\n\n` +
-          `• Оборудование <b>«${escapeHtml(item["Тип"] || '')} ${escapeHtml(item["Марка"] || '')}»</b> зачислено на Склад.\n` +
+        text: `🟢 <b>Техника успешно сдана на склад!</b>\n\n` +
+          `• Оборудование <b>«${escapeHtml(item["Тип"] || '')} ${escapeHtml(item["Марка"] || '')}»</b> зачислено на Склад (в наличии).\n` +
           `• Сотрудник <b>${escapeHtml(userName)}</b> больше не числится ответственным.\n` +
-          `• В Google Таблицу внесена пометка:\n<code>(Возврат от: ${escapeHtml(userName)}, ${new Date().toLocaleDateString('ru-RU')})</code>.`,
+          `• Строка удалена из листа сотрудников (Лист1).\n` +
+          `• Google Таблица синхронизирована!`,
         inlineKeyboard: [
           [{ text: '👤 Вернуться к сотруднику', callback_data: `vu:${rawKey}` }],
           [{ text: '📦 Открыть остатки Склада', callback_data: 'warehouse_view' }],
